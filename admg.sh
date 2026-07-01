@@ -43,7 +43,7 @@ parse_flags() {
 unit_exists() {
   local u=$1
   if command -v systemctl >/dev/null 2>&1; then
-    systemctl list-unit-files --type=service | grep -q "^${u}" || return 1
+    systemctl list-unit-files --type=service 2>/dev/null | grep -c "^${u}" >/dev/null || return 1
     return 0
   fi
   return 1
@@ -126,43 +126,114 @@ svc_action() {
   fi
 }
 
+# 简洁状态输出 (用于 start/stop 后)
+show_simple_status() {
+  local unit=$1
+  if [[ "$unit" == "nginx.service" ]]; then
+    pidfile="${PREFIX_NGINX}/logs/nginx.pid"
+    bin="${PREFIX_NGINX}/sbin/nginx"
+    echo "binary: $bin"
+    echo "pidfile: $pidfile"
+    if [ -f "$pidfile" ]; then
+      pid=$(cat "$pidfile" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+        echo "nginx 正在运行 (PID=$pid)"
+      else
+        echo "nginx pidfile 存在但进程未运行"
+      fi
+    else
+      echo "nginx 已经停止运行"
+    fi
+  elif [[ "$unit" == "php-fpm.service" ]]; then
+    pidfile="${PREFIX_PHP}/var/run/php-fpm.pid"
+    bin="${PREFIX_PHP}/sbin/php-fpm"
+    echo "binary: $bin"
+    echo "pidfile: $pidfile"
+    if [ -f "$pidfile" ]; then
+      pid=$(cat "$pidfile" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+        echo "php-fpm 正在运行 (PID=$pid)"
+      else
+        echo "php-fpm pidfile 存在但进程未运行"
+      fi
+    else
+      echo "php-fpm 已经停止运行"
+    fi
+  fi
+}
+
 show_status() {
   local unit=$1
-  if unit_exists "$unit"; then
-    echo "---- systemd 状态: ${unit} ----"
-    systemctl status ${unit} --no-pager || true
-  else
-    # 非 systemd 情况：仅输出关键二进制与 pidfile 信息与运行状态
-    if [[ "$unit" == "nginx.service" ]]; then
-      pidfile="${PREFIX_NGINX}/logs/nginx.pid"
-      bin="${PREFIX_NGINX}/sbin/nginx"
-      echo "binary: $bin"
-      echo "pidfile: $pidfile"
-      if [ -f "$pidfile" ]; then
-        pid=$(cat "$pidfile" 2>/dev/null || true)
-        if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
-          echo "nginx 正在运行 (PID=$pid)"
-        else
-          echo "nginx pidfile 存在但进程未运行"
-        fi
+  if [[ "$unit" == "nginx.service" ]]; then
+    pidfile="${PREFIX_NGINX}/logs/nginx.pid"
+    bin="${PREFIX_NGINX}/sbin/nginx"
+    if [ -f "$pidfile" ]; then
+      pid=$(cat "$pidfile" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+        # 获取 nginx 版本
+        local nginx_ver=$( ${bin} -v 2>&1 | awk '{print $3}' | sed 's/nginx\///' )
+        # 获取编译时间 (从 nginx 二进制文件的修改时间)
+        local compile_time=$( stat -c '%y' "$bin" 2>/dev/null | cut -d. -f1 | sed 's/-/:/g' | tr ':' '-' | cut -d' ' -f1 )
+        # 获取 worker 进程数
+        local worker_total=$( ps --ppid "$pid" -o pid= 2>/dev/null | wc -l )
+        local worker_running=$( ps --ppid "$pid" -o stat= 2>/dev/null | grep -c 'R' 2>/dev/null || true )
+        # 获取运行时间
+        local start_time=$( stat -c '%Y' "/proc/${pid}" 2>/dev/null || echo "$(date +%s)" )
+        local now=$( date +%s )
+        local uptime_sec=$(( now - start_time ))
+        local uptime_d=$(( uptime_sec / 86400 ))
+        local uptime_h=$(( (uptime_sec % 86400) / 3600 ))
+        local uptime_m=$(( (uptime_sec % 3600) / 60 ))
+        local uptime_str=$( printf "%dd %02dh" "${uptime_d}" "${uptime_h}" )
+        # 获取重载次数
+        local reload_count=$( journalctl -u nginx.service --no-pager 2>/dev/null | grep -c 'signal process started' || true )
+        # 配置测试
+        local config_test=$( ${bin} -t 2>&1 | grep -q "successful" && echo "PASS" || echo "FAIL" )
+
+        echo "运行状态             : 正在运行"
+        echo "Nginx Version        : ${nginx_ver}"
+        echo "Compile Time         : ${compile_time}"
+        echo "Master PID           : ${pid}"
+        echo "Worker Processes     : ${worker_total}"
+        echo "Worker Running       : ${worker_running}"
+        echo "Uptime               : ${uptime_str}"
+        echo "Reload Count         : ${reload_count}"
+        echo "Config Test          : ${config_test}"
+        echo "Config Path          : ${PREFIX_NGINX}/conf/nginx.conf"
       else
-        echo "nginx 未运行或未生成 pidfile"
+        echo "运行状态             : pidfile 存在但进程未运行"
       fi
-    elif [[ "$unit" == "php-fpm.service" ]]; then
-      pidfile="${PREFIX_PHP}/var/run/php-fpm.pid"
-      bin="${PREFIX_PHP}/sbin/php-fpm"
-      echo "binary: $bin"
-      echo "pidfile: $pidfile"
-      if [ -f "$pidfile" ]; then
-        pid=$(cat "$pidfile" 2>/dev/null || true)
-        if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
-          echo "php-fpm 正在运行 (PID=$pid)"
-        else
-          echo "php-fpm pidfile 存在但进程未运行"
-        fi
+    else
+      echo "运行状态             : 已停止"
+    fi
+  elif [[ "$unit" == "php-fpm.service" ]]; then
+    pidfile="${PREFIX_PHP}/var/run/php-fpm.pid"
+    bin="${PREFIX_PHP}/sbin/php-fpm"
+    echo "binary: $bin"
+    echo "pidfile: $pidfile"
+    if [ -f "$pidfile" ]; then
+      pid=$(cat "$pidfile" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+        echo "php-fpm 正在运行 (PID=$pid)"
+        local pm_count=$(ps --ppid "$pid" -o pid= 2>/dev/null | wc -l)
+        echo "php-fpm 进程数: ${pm_count}"
       else
-        echo "php-fpm 未运行或未生成 pidfile"
+        echo "php-fpm pidfile 存在但进程未运行"
       fi
+    else
+      echo "php-fpm 已经停止运行"
+    fi
+    # 显示 PHP 关键参数
+    if [ -x "${PREFIX_PHP}/bin/php" ]; then
+      echo "PHP 版本: $( ${PREFIX_PHP}/bin/php -r 'echo PHP_VERSION;' 2>/dev/null)"
+      echo "memory_limit: $( ${PREFIX_PHP}/bin/php -r 'echo ini_get("memory_limit");' 2>/dev/null)"
+      echo "max_execution_time: $( ${PREFIX_PHP}/bin/php -r 'echo ini_get("max_execution_time");' 2>/dev/null)s"
+      echo "upload_max_filesize: $( ${PREFIX_PHP}/bin/php -r 'echo ini_get("upload_max_filesize");' 2>/dev/null)"
+      echo "post_max_size: $( ${PREFIX_PHP}/bin/php -r 'echo ini_get("post_max_size");' 2>/dev/null)"
+      echo "max_input_vars: $( ${PREFIX_PHP}/bin/php -r 'echo ini_get("max_input_vars");' 2>/dev/null)"
+      echo "display_errors: $( ${PREFIX_PHP}/bin/php -r 'echo ini_get("display_errors");' 2>/dev/null)"
+      echo "date.timezone: $( ${PREFIX_PHP}/bin/php -r 'echo ini_get("date.timezone");' 2>/dev/null)"
+      echo "OPcache: $( ${PREFIX_PHP}/bin/php -r 'echo extension_loaded("Zend OPcache") ? "已启用" : "未启用";' 2>/dev/null)"
     fi
   fi
 }
@@ -220,7 +291,7 @@ case "$TARGET" in
       start|restart|reload|stop)
         svc_action "$unit" "$ACTION"
         sleep 1
-        show_status "$unit"
+        show_simple_status "$unit"
         ;;
       status)
         show_status "$unit"
@@ -240,7 +311,7 @@ case "$TARGET" in
       start|restart|reload|stop)
         svc_action "$unit" "$ACTION"
         sleep 1
-        show_status "$unit"
+        show_simple_status "$unit"
         ;;
       status)
         show_status "$unit"

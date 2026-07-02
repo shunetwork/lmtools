@@ -297,13 +297,18 @@ show_simple_status() {
       if [ -z "$pid" ] && command -v systemctl >/dev/null 2>&1; then
         pid=$(systemctl show redis.service -p MainPID 2>/dev/null | cut -d= -f2)
       fi
-      # 如果 systemd 也没有，尝试 pgrep
+      # 如果 systemd 也没有，尝试 pgrep（不用 -x，进程名可能不精确匹配）
       if [ -z "$pid" ] || ! is_running "$pid"; then
-        pid=$(pgrep -x redis-server 2>/dev/null | head -1 || true)
+        pid=$(pgrep redis-server 2>/dev/null | head -1 || true)
+      fi
+      # 最后尝试通过 ps 直接查找
+      if [ -z "$pid" ] || ! is_running "$pid"; then
+        pid=$(ps -ef 2>/dev/null | grep '[r]edis-server' | awk '{print $2}' | head -1 || true)
       fi
       if [ -n "$pid" ] && is_running "$pid"; then echo "Redis 正在运行 (PID=$pid)"
       elif [ -n "$pid" ]; then echo "Redis pidfile 存在但进程未运行"
       else echo "Redis 已经停止运行"; fi ;;
+
   esac
 }
 
@@ -442,12 +447,17 @@ show_status() {
       if [ -z "$pid" ] && command -v systemctl >/dev/null 2>&1; then
         pid=$(systemctl show redis.service -p MainPID 2>/dev/null | cut -d= -f2)
       fi
-      # 如果 systemd 也没有，尝试 pgrep
+      # 如果 systemd 也没有，尝试 pgrep（不用 -x，进程名可能不精确匹配）
       if [ -z "$pid" ] || ! is_running "$pid"; then
-        pid=$(pgrep -x redis-server 2>/dev/null | head -1 || true)
+        pid=$(pgrep redis-server 2>/dev/null | head -1 || true)
+      fi
+      # 最后尝试通过 ps 直接查找
+      if [ -z "$pid" ] || ! is_running "$pid"; then
+        pid=$(ps -ef 2>/dev/null | grep '[r]edis-server' | awk '{print $2}' | head -1 || true)
       fi
 
       if [ -n "$pid" ] && is_running "$pid"; then
+
         # ---- 从配置读取端口、密码、bind ----
         local port="6379"
         local auth=""

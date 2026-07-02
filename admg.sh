@@ -263,6 +263,18 @@ show_simple_status() {
       echo "binary: $bin"
       echo "pidfile: $pidfile"
       local pid; pid=$(get_pid "$pidfile")
+      # 如果 pidfile 不存在，尝试从 systemd 获取 PID
+      if [ -z "$pid" ] && command -v systemctl >/dev/null 2>&1; then
+        pid=$(systemctl show php-fpm.service -p MainPID 2>/dev/null | cut -d= -f2)
+      fi
+      # 如果 systemd 也没有，尝试 pgrep（不用 -x，因为进程名可能包含额外信息）
+      if [ -z "$pid" ] || ! is_running "$pid"; then
+        pid=$(pgrep php-fpm 2>/dev/null | head -1 || true)
+      fi
+      # 最后尝试通过 ps 直接查找
+      if [ -z "$pid" ] || ! is_running "$pid"; then
+        pid=$(ps -ef 2>/dev/null | grep '[p]hp-fpm:' | awk '{print $2}' | head -1 || true)
+      fi
       if [ -n "$pid" ] && is_running "$pid"; then echo "php-fpm 正在运行 (PID=$pid)"
       elif [ -n "$pid" ]; then echo "php-fpm pidfile 存在但进程未运行"
       else echo "php-fpm 已经停止运行"; fi ;;
@@ -327,6 +339,18 @@ show_status() {
       local pidfile="${PREFIX_PHP}/var/run/php-fpm.pid"
       local bin="${PREFIX_PHP}/sbin/php-fpm"
       local pid; pid=$(get_pid "$pidfile")
+      # 如果 pidfile 不存在，尝试从 systemd 获取 PID
+      if [ -z "$pid" ] && command -v systemctl >/dev/null 2>&1; then
+        pid=$(systemctl show php-fpm.service -p MainPID 2>/dev/null | cut -d= -f2)
+      fi
+      # 如果 systemd 也没有，尝试 pgrep（不用 -x，因为进程名可能包含额外信息）
+      if [ -z "$pid" ] || ! is_running "$pid"; then
+        pid=$(pgrep php-fpm 2>/dev/null | head -1 || true)
+      fi
+      # 最后尝试通过 ps 直接查找
+      if [ -z "$pid" ] || ! is_running "$pid"; then
+        pid=$(ps -ef 2>/dev/null | grep '[p]hp-fpm:' | awk '{print $2}' | head -1 || true)
+      fi
       if [ -n "$pid" ] && is_running "$pid"; then
         echo "运行状态             : 正在运行"
         echo "Master PID           : ${pid}"

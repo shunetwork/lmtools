@@ -175,7 +175,6 @@ redis_direct() {
   local action=$1
   local bin="${PREFIX_REDIS}/bin/redis-server"
   local cli="${PREFIX_REDIS}/bin/redis-cli"
-  local pidfile="/var/run/redis/redis.pid"
   # 尝试多个可能的配置文件路径
   local conf=""
   for c in /www/server/redis/redis.conf /etc/redis/redis.conf "${PREFIX_REDIS}/redis.conf"; do
@@ -183,10 +182,13 @@ redis_direct() {
   done
   [ -z "$conf" ] && conf="/etc/redis/redis.conf"
   local port="6379"
-  # 从配置中读取端口
+  local pidfile="/var/run/redis/redis.pid"
+  # 从配置中读取端口和 pidfile
   if [ -f "$conf" ]; then
     local conf_port; conf_port=$(grep -E "^port " "$conf" 2>/dev/null | awk '{print $2}')
     [ -n "$conf_port" ] && port="$conf_port"
+    local conf_pidfile; conf_pidfile=$(grep -E "^pidfile " "$conf" 2>/dev/null | awk '{print $2}')
+    [ -n "$conf_pidfile" ] && pidfile="$conf_pidfile"
   fi
   case "$action" in
     start)
@@ -288,8 +290,15 @@ show_simple_status() {
       elif [ -n "$pid" ]; then echo "MySQL pidfile 存在但进程未运行"
       else echo "MySQL 已经停止运行"; fi ;;
     redis.service)
-      local pidfile="/var/run/redis/redis.pid"
       local bin="${PREFIX_REDIS}/bin/redis-server"
+      # 从配置读取 pidfile 路径
+      local pidfile="/var/run/redis/redis.pid"
+      local conf=""
+      for c in /www/server/redis/redis.conf /etc/redis/redis.conf "${PREFIX_REDIS}/redis.conf"; do
+        [ -f "$c" ] && { conf="$c"; break; }
+      done
+      [ -f "$conf" ] && local conf_pidfile; conf_pidfile=$(grep -E "^pidfile " "$conf" 2>/dev/null | awk '{print $2}')
+      [ -n "$conf_pidfile" ] && pidfile="$conf_pidfile"
       echo "binary: $bin"
       echo "pidfile: $pidfile"
       local pid; pid=$(get_pid "$pidfile")
@@ -432,7 +441,6 @@ show_status() {
       echo "Socket               : /var/run/mysqld/mysqld.sock"
       echo "Error Log            : /var/log/mysqld.err" ;;
     redis.service)
-      local pidfile="/var/run/redis/redis.pid"
       local bin="${PREFIX_REDIS}/bin/redis-server"
       local cli="${PREFIX_REDIS}/bin/redis-cli"
       # 尝试多个可能的配置文件路径
@@ -441,6 +449,13 @@ show_status() {
         [ -f "$c" ] && { conf="$c"; break; }
       done
       [ -z "$conf" ] && conf="/etc/redis/redis.conf"
+
+      # 从配置读取 pidfile 路径
+      local pidfile="/var/run/redis/redis.pid"
+      if [ -f "$conf" ]; then
+        local conf_pidfile; conf_pidfile=$(grep -E "^pidfile " "$conf" 2>/dev/null | awk '{print $2}')
+        [ -n "$conf_pidfile" ] && pidfile="$conf_pidfile"
+      fi
 
       local pid; pid=$(get_pid "$pidfile")
       # 如果 pidfile 不存在，尝试从 systemd 获取 PID
@@ -753,12 +768,18 @@ show_config() {
       echo "client:       ${PREFIX_REDIS}/bin/redis-cli"
       echo "config:       ${conf}"
       echo "datadir:      /var/lib/redis"
-      echo "pidfile:      /var/run/redis/redis.pid"
+      # 从配置读取 pidfile 路径
+      local cfg_pidfile="/var/run/redis/redis.pid"
+      if [ -f "$conf" ]; then
+        local _pidf; _pidf=$(grep -E "^pidfile " "$conf" 2>/dev/null | awk '{print $2}')
+        [ -n "$_pidf" ] && cfg_pidfile="$_pidf"
+      fi
+      echo "pidfile:      ${cfg_pidfile}"
       echo "log file:     /var/log/redis/redis.log"
       if [ -f "$conf" ]; then
         echo
         echo "redis.conf 关键配置:"
-        grep -E "^(port|bind|requirepass|daemonize|supervised|appendonly|dir|logfile)" "$conf" 2>/dev/null || true
+        grep -E "^(port|bind|requirepass|daemonize|supervised|appendonly|dir|logfile|pidfile)" "$conf" 2>/dev/null || true
       fi
       if [ -x "${PREFIX_REDIS}/bin/redis-cli" ]; then
         echo

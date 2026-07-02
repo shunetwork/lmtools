@@ -75,34 +75,48 @@ is_running() {
 # ---- 服务操作 ----
 svc_action() {
   local unit=$1; local action=$2
-  if unit_exists "$unit"; then
-    # 对于 redis stop，需要临时禁用 Restart=always 防止 systemd 自动重启
-    if [ "$unit" = "redis.service" ] && [ "$action" = "stop" ]; then
-      local restart_policy
-      restart_policy=$(systemctl show redis.service -p Restart 2>/dev/null | cut -d= -f2 || true)
-      if [ "$restart_policy" = "always" ] || [ "$restart_policy" = "on-failure" ]; then
-        echo "检测到 Restart=${restart_policy}，临时禁用自动重启..."
-        systemctl stop redis.service 2>/dev/null || true
-        # 使用 systemd-run 启动一个一次性实例来临时覆盖 Restart 策略
-        systemctl set-property redis.service Restart=no 2>/dev/null || true
-        systemctl stop redis.service 2>/dev/null || true
-        # 恢复 Restart 策略
-        systemctl set-property redis.service Restart="${restart_policy}" 2>/dev/null || true
-        echo "Redis 已停止（已恢复 Restart=${restart_policy}）"
-      else
-        echo "使用 systemctl ${action} ${unit}"
-        systemctl ${action} ${unit} || true
+  # 对于 redis，优先尝试 systemctl（即使 unit_exists 检测失败）
+  if [ "$unit" = "redis.service" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      local svc_exists
+      svc_exists=$(systemctl list-unit-files --type=service 2>/dev/null | grep -c "^redis.service" || true)
+      if [ "$svc_exists" -gt 0 ]; then
+        if [ "$action" = "stop" ]; then
+          # 处理 Restart=always：临时禁用自动重启，停止后再恢复
+          local restart_policy
+          restart_policy=$(systemctl show redis.service -p Restart 2>/dev/null | cut -d= -f2 || true)
+          if [ "$restart_policy" = "always" ] || [ "$restart_policy" = "on-failure" ]; then
+            echo "检测到 Restart=${restart_policy}，临时禁用自动重启..."
+            systemctl set-property redis.service Restart=no 2>/dev/null || true
+            systemctl stop redis.service 2>/dev/null || true
+            # 恢复 Restart 策略
+            systemctl set-property redis.service Restart="${restart_policy}" 2>/dev/null || true
+            echo "Redis 已停止（已恢复 Restart=${restart_policy}）"
+          else
+            echo "使用 systemctl ${action} ${unit}"
+            systemctl "${action}" "${unit}" || true
+          fi
+        else
+          echo "使用 systemctl ${action} ${unit}"
+          systemctl "${action}" "${unit}" || true
+        fi
+        return
       fi
-    else
-      echo "使用 systemctl ${action} ${unit}"
-      systemctl ${action} ${unit} || true
     fi
+    # systemctl 不可用或服务不存在，走 redis_direct
+    redis_direct "$action"
+    return
+  fi
+
+  # 其他服务（nginx/php/mysql）保持原有逻辑
+  if unit_exists "$unit"; then
+    echo "使用 systemctl ${action} ${unit}"
+    systemctl "${action}" "${unit}" || true
   else
     case "$unit" in
       nginx.service)    nginx_direct "$action" ;;
       php-fpm.service)  php_direct "$action" ;;
       mysqld.service)   mysql_direct "$action" ;;
-      redis.service)    redis_direct "$action" ;;
       *) echo "未知服务单元：$unit" ;;
     esac
   fi

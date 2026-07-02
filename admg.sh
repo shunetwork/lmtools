@@ -190,13 +190,32 @@ redis_direct() {
     local conf_pidfile; conf_pidfile=$(grep -E "^pidfile " "$conf" 2>/dev/null | awk '{print $2}')
     [ -n "$conf_pidfile" ] && pidfile="$conf_pidfile"
   fi
+
+  # 获取 Redis PID 的通用函数：优先 pidfile，其次 systemd，其次 pgrep，其次 ps
+  _redis_get_pid() {
+    local p
+    p=$(get_pid "$pidfile")
+    if [ -z "$p" ] || ! is_running "$p"; then
+      if command -v systemctl >/dev/null 2>&1; then
+        p=$(systemctl show redis.service -p MainPID 2>/dev/null | cut -d= -f2)
+      fi
+    fi
+    # systemctl 可能返回 0（已退出），过滤掉
+    [ "$p" = "0" ] && p=""
+    if [ -z "$p" ] || ! is_running "$p"; then
+      p=$(pgrep redis-server 2>/dev/null | head -1 || true)
+    fi
+    if [ -z "$p" ] || ! is_running "$p"; then
+      p=$(ps -ef 2>/dev/null | grep '[r]edis-server' | awk '{print $2}' | head -1 || true)
+    fi
+    echo "$p"
+  }
+
   case "$action" in
     start)
       if [ -x "$bin" ]; then
-        if [ -f "$pidfile" ]; then
-          local pid; pid=$(get_pid "$pidfile")
-          if is_running "$pid"; then echo "Redis 已在运行 (PID=$pid)"; return; fi
-        fi
+        local pid; pid=$(_redis_get_pid)
+        if is_running "$pid"; then echo "Redis 已在运行 (PID=$pid)"; return; fi
         # 如果配置中 supervised 为 systemd，优先使用 systemd-run 启动
         if grep -q "^supervised systemd" "$conf" 2>/dev/null; then
           systemctl start redis.service 2>/dev/null || true
@@ -209,13 +228,13 @@ redis_direct() {
         echo "未找到 $bin"
       fi ;;
     reload)
-      local pid; pid=$(get_pid "$pidfile")
+      local pid; pid=$(_redis_get_pid)
       if [ -n "$pid" ] && is_running "$pid"; then
         kill -HUP "$pid" 2>/dev/null || true
         echo "Redis 已重载"
       fi ;;
     restart)
-      local pid; pid=$(get_pid "$pidfile")
+      local pid; pid=$(_redis_get_pid)
       if [ -n "$pid" ] && is_running "$pid"; then
         kill -QUIT "$pid" 2>/dev/null || true
         sleep 2
@@ -230,7 +249,7 @@ redis_direct() {
         sleep 2
       fi ;;
     stop)
-      local pid; pid=$(get_pid "$pidfile")
+      local pid; pid=$(_redis_get_pid)
       if [ -n "$pid" ] && is_running "$pid"; then
         # 优先使用 redis-cli shutdown 优雅关闭
         if [ -x "$cli" ]; then
@@ -242,6 +261,8 @@ redis_direct() {
           kill -QUIT "$pid" 2>/dev/null || true
         fi
         echo "Redis 停止中..."
+      else
+        echo "Redis 未在运行"
       fi ;;
   esac
 }
@@ -306,6 +327,8 @@ show_simple_status() {
       if [ -z "$pid" ] && command -v systemctl >/dev/null 2>&1; then
         pid=$(systemctl show redis.service -p MainPID 2>/dev/null | cut -d= -f2)
       fi
+      # systemctl 可能返回 0（已退出），过滤掉
+      [ "$pid" = "0" ] && pid=""
       # 如果 systemd 也没有，尝试 pgrep（不用 -x，进程名可能不精确匹配）
       if [ -z "$pid" ] || ! is_running "$pid"; then
         pid=$(pgrep redis-server 2>/dev/null | head -1 || true)

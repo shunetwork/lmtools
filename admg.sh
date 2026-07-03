@@ -206,6 +206,15 @@ mysql_direct() {
   esac
 }
 
+# 查找 redis-server 可执行文件（按优先级）
+_find_redis_server() {
+  local bin=""
+  for b in "${PREFIX_REDIS}/bin/redis-server" "/usr/local/bin/redis-server" "/usr/bin/redis-server"; do
+    [ -x "$b" ] && { bin="$b"; break; }
+  done
+  echo "$bin"
+}
+
 # 查找 redis-cli 可执行文件（按优先级）
 _find_redis_cli() {
   local cli=""
@@ -217,7 +226,7 @@ _find_redis_cli() {
 
 # ---- Redis 配置检查 ----
 redis_check() {
-  local bin="${PREFIX_REDIS}/bin/redis-server"
+  local bin; bin=$(_find_redis_server)
   local cli; cli=$(_find_redis_cli)
 
   # 尝试多个可能的配置文件路径
@@ -565,7 +574,7 @@ redis_check() {
 
 redis_direct() {
   local action=$1
-  local bin="${PREFIX_REDIS}/bin/redis-server"
+  local bin; bin=$(_find_redis_server)
   local cli; cli=$(_find_redis_cli)
   # 尝试多个可能的配置文件路径
   local conf=""
@@ -703,7 +712,7 @@ show_simple_status() {
       elif [ -n "$pid" ]; then echo "MySQL pidfile 存在但进程未运行"
       else echo "MySQL 已经停止运行"; fi ;;
     redis.service)
-      local bin="${PREFIX_REDIS}/bin/redis-server"
+      local bin; bin=$(_find_redis_server)
       # 从配置读取 pidfile 路径
       local pidfile="/var/run/redis/redis.pid"
       local conf=""
@@ -856,7 +865,7 @@ show_status() {
       echo "Socket               : /var/run/mysqld/mysqld.sock"
       echo "Error Log            : /var/log/mysqld.err" ;;
     redis.service)
-      local bin="${PREFIX_REDIS}/bin/redis-server"
+      local bin; bin=$(_find_redis_server)
       local cli; cli=$(_find_redis_cli)
       # 尝试多个可能的配置文件路径
       local conf=""
@@ -1178,10 +1187,11 @@ show_config() {
       done
       [ -z "$conf" ] && conf="/etc/redis/redis.conf"
 
+      local bin; bin=$(_find_redis_server)
       local cli; cli=$(_find_redis_cli)
 
       echo "---- Redis 配置与位置 ----"
-      echo "binary:       ${PREFIX_REDIS}/bin/redis-server"
+      echo "binary:       ${bin:-${PREFIX_REDIS}/bin/redis-server (未找到)}"
       echo "client:       ${cli:-${PREFIX_REDIS}/bin/redis-cli (未找到)}"
       echo "config:       ${conf}"
       echo "datadir:      /var/lib/redis"

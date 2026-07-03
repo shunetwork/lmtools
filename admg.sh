@@ -12,7 +12,7 @@ PREFIX_REDIS=/usr/local/redis
 
 usage() {
   cat <<EOF
-用法: $0 [OPTIONS] <nginx|php|mysql|redis> <start|restart|reload|status|config|help>
+用法: $0 [OPTIONS] <nginx|php|mysql|redis> <start|restart|reload|status|config|check|help>
 
 选项:
   --prefix-nginx PATH   Nginx 安装前缀（默认: ${PREFIX_NGINX}）
@@ -26,11 +26,13 @@ usage() {
   $0 mysql status
   $0 redis status
   $0 --prefix-redis /opt/redis redis config
+  $0 redis check
 
 功能:
   start/restart/reload  启动/重启/重载 服务并输出最新状态
   status                输出服务状态（systemd 或 pidfile 检查）
   config                列出关键二进制和配置文件位置
+  check                 检查配置参数是否合理（当前仅支持 redis）
   help                  显示本帮助
 
 EOF
@@ -211,6 +213,354 @@ _find_redis_cli() {
     [ -x "$c" ] && { cli="$c"; break; }
   done
   echo "$cli"
+}
+
+# ---- Redis 配置检查 ----
+redis_check() {
+  local bin="${PREFIX_REDIS}/bin/redis-server"
+  local cli; cli=$(_find_redis_cli)
+
+  # 尝试多个可能的配置文件路径
+  local conf=""
+  for c in /www/server/redis/redis.conf /etc/redis/redis.conf "${PREFIX_REDIS}/redis.conf"; do
+    [ -f "$c" ] && { conf="$c"; break; }
+  done
+  [ -z "$conf" ] && conf="/etc/redis/redis.conf"
+
+  local errors=0
+  local warnings=0
+  local checks=0
+
+  echo ""
+  echo "========================================"
+  echo "Redis 配置检查"
+  echo "========================================"
+
+  # 1. 检查 redis-server 二进制是否存在
+  checks=$((checks + 1))
+  if [ -x "$bin" ]; then
+    echo "✅ [PASS] redis-server 二进制: ${bin}"
+  else
+    echo "❌ [FAIL] redis-server 二进制不存在: ${bin}"
+    errors=$((errors + 1))
+  fi
+
+  # 2. 检查 redis-cli 是否存在
+  checks=$((checks + 1))
+  if [ -n "$cli" ] && [ -x "$cli" ]; then
+    echo "✅ [PASS] redis-cli 客户端: ${cli}"
+  else
+    echo "❌ [FAIL] redis-cli 客户端未找到"
+    errors=$((errors + 1))
+  fi
+
+  # 3. 检查配置文件是否存在
+  checks=$((checks + 1))
+  if [ -f "$conf" ]; then
+    echo "✅ [PASS] 配置文件: ${conf}"
+  else
+    echo "❌ [FAIL] 配置文件不存在: ${conf}"
+    errors=$((errors + 1))
+  fi
+
+  # 如果配置文件不存在，后续检查无法进行
+  if [ ! -f "$conf" ]; then
+    echo ""
+    echo "========================================"
+    echo "检查结果: ${errors} 个错误, ${warnings} 个警告 (共 ${checks} 项)"
+    echo "========================================"
+    return
+  fi
+
+  # 4. 检查端口配置
+  checks=$((checks + 1))
+  local port; port=$(grep -E "^port " "$conf" 2>/dev/null | awk '{print $2}')
+  if [ -n "$port" ]; then
+    if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+      echo "✅ [PASS] 端口: ${port} (有效范围)"
+      # 检查端口是否被占用（非 Redis 进程）
+      local port_pid; port_pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | awk -F'pid=' '{print $2}' | cut -d, -f1 | head -1 || true)
+      local redis_pid; redis_pid=$(pgrep redis-server 2>/dev/null | head -1 || true)
+      if [ -n "$port_pid" ] && [ "$port_pid" != "$redis_pid" ]; then
+        echo "⚠️  [WARN] 端口 ${port} 被非 Redis 进程占用 (PID: ${port_pid})"
+        warnings=$((warnings + 1))
+      fi
+    else
+      echo "❌ [FAIL] 端口: ${port} (无效范围，应为 1-65535)"
+      errors=$((errors + 1))
+    fi
+  else
+    echo "⚠️  [WARN] 未配置 port，将使用默认 6379"
+    warnings=$((warnings + 1))
+  fi
+
+  # 5. 检查 bind 地址安全性
+  checks=$((checks + 1))
+  local bind; bind=$(grep -E "^bind " "$conf" 2>/dev/null | awk '{print $2}')
+  if [ -n "$bind" ]; then
+    if echo "$bind" | grep -q "0.0.0.0"; then
+      echo "⚠️  [WARN] bind 为 0.0.0.0 (监听所有网卡，建议仅绑定内网 IP)"
+      warnings=$((warnings + 1))
+    elif echo "$bind" | grep -qE "^(127\.0\.0\.1|localhost)$"; then
+      echo "✅ [PASS] bind: ${bind} (仅本地监听，安全)"
+    else
+      echo "ℹ️  [INFO] bind: ${bind} (非本地地址，请确认安全策略)"
+    fi
+  else
+    echo "⚠️  [WARN] 未配置 bind，默认监听 0.0.0.0 (所有网卡)"
+    warnings=$((warnings + 1))
+  fi
+
+  # 6. 检查密码认证
+  checks=$((checks + 1))
+  local requirepass; requirepass=$(grep -E "^requirepass " "$conf" 2>/dev/null | awk '{print $2}')
+  if [ -n "$requirepass" ]; then
+    if [ ${#requirepass} -ge 8 ]; then
+      echo "✅ [PASS] 密码认证已开启 (密码长度 ${#requirepass} 位)"
+    else
+      echo "⚠️  [WARN] 密码长度 ${#requirepass} 位 (建议 ≥ 8 位)"
+      warnings=$((warnings + 1))
+    fi
+  else
+    echo "❌ [FAIL] 未设置 requirepass (无密码认证，存在安全风险)"
+    errors=$((errors + 1))
+  fi
+
+  # 7. 检查 daemonize / supervised 配置
+  checks=$((checks + 1))
+  local daemonize; daemonize=$(grep -E "^daemonize " "$conf" 2>/dev/null | awk '{print $2}')
+  local supervised; supervised=$(grep -E "^supervised " "$conf" 2>/dev/null | awk '{print $2}')
+  if [ -n "$supervised" ] && [ "$supervised" != "no" ]; then
+    echo "✅ [PASS] supervised: ${supervised} (由 systemd/upstart 管理)"
+  elif [ "$daemonize" = "yes" ]; then
+    echo "ℹ️  [INFO] daemonize: yes (后台守护进程模式)"
+  else
+    echo "ℹ️  [INFO] daemonize: no, supervised: ${supervised:-未配置} (前台运行)"
+  fi
+
+  # 8. 检查内存限制
+  checks=$((checks + 1))
+  local maxmemory; maxmemory=$(grep -E "^maxmemory " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$maxmemory" ]; then
+    if [ "$maxmemory" -gt 0 ] 2>/dev/null; then
+      local maxmem_mb=$(( maxmemory / 1024 / 1024 ))
+      echo "✅ [PASS] maxmemory: ${maxmem_mb}MB (已设置内存上限)"
+    elif [ "$maxmemory" -eq 0 ] 2>/dev/null; then
+      echo "⚠️  [WARN] maxmemory: 0 (无内存上限，可能导致 OOM)"
+      warnings=$((warnings + 1))
+    fi
+  else
+    echo "⚠️  [WARN] 未配置 maxmemory (无内存上限，可能导致 OOM)"
+    warnings=$((warnings + 1))
+  fi
+
+  # 9. 检查内存淘汰策略
+  checks=$((checks + 1))
+  local maxmemory_policy; maxmemory_policy=$(grep -E "^maxmemory-policy " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$maxmemory_policy" ]; then
+    case "$maxmemory_policy" in
+      allkeys-lru|volatile-lru|allkeys-lfu|volatile-lfu)
+        echo "✅ [PASS] maxmemory-policy: ${maxmemory_policy} (推荐策略)" ;;
+      allkeys-random|volatile-random)
+        echo "ℹ️  [INFO] maxmemory-policy: ${maxmemory_policy} (随机淘汰)" ;;
+      volatile-ttl)
+        echo "ℹ️  [INFO] maxmemory-policy: ${maxmemory_policy} (按 TTL 淘汰)" ;;
+      noeviction)
+        echo "⚠️  [WARN] maxmemory-policy: noeviction (内存满时写入会返回错误)"
+        warnings=$((warnings + 1)) ;;
+      *)
+        echo "ℹ️  [INFO] maxmemory-policy: ${maxmemory_policy}" ;;
+    esac
+  else
+    echo "⚠️  [WARN] 未配置 maxmemory-policy (默认 noeviction)"
+    warnings=$((warnings + 1))
+  fi
+
+  # 10. 检查持久化配置
+  checks=$((checks + 1))
+  local save_rules; save_rules=$(grep -E "^save " "$conf" 2>/dev/null | grep -v "^#" | awk '{print $0}' | head -5 || true)
+  local appendonly; appendonly=$(grep -E "^appendonly " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$save_rules" ]; then
+    echo "✅ [PASS] RDB 持久化已配置:"
+    local save_line
+    while IFS= read -r save_line; do
+      echo "         ${save_line}"
+    done <<< "$save_rules"
+  else
+    echo "⚠️  [WARN] 未配置 RDB save 规则 (默认配置可能不满足需求)"
+    warnings=$((warnings + 1))
+  fi
+  if [ "$appendonly" = "yes" ]; then
+    echo "✅ [PASS] AOF 持久化已开启"
+    local appendfsync; appendfsync=$(grep -E "^appendfsync " "$conf" 2>/dev/null | awk '{print $2}' || true)
+    if [ -n "$appendfsync" ]; then
+      echo "         appendfsync: ${appendfsync}"
+    fi
+  else
+    echo "ℹ️  [INFO] AOF 持久化未开启 (仅使用 RDB)"
+  fi
+
+  # 11. 检查数据目录
+  checks=$((checks + 1))
+  local dir; dir=$(grep -E "^dir " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$dir" ]; then
+    if [ -d "$dir" ]; then
+      echo "✅ [PASS] 数据目录: ${dir}"
+      local avail; avail=$(df -BM "$dir" 2>/dev/null | awk 'NR==2{print $4}' | sed 's/M//' || true)
+      if [ -n "$avail" ] && [ "$avail" -lt 1024 ]; then
+        echo "⚠️  [WARN] 数据目录磁盘剩余空间不足: ${avail}MB (< 1GB)"
+        warnings=$((warnings + 1))
+      elif [ -n "$avail" ]; then
+        echo "         磁盘剩余空间: ${avail}MB"
+      fi
+    else
+      echo "❌ [FAIL] 数据目录不存在: ${dir}"
+      errors=$((errors + 1))
+    fi
+  else
+    echo "⚠️  [WARN] 未配置 dir (使用默认 /var/lib/redis)"
+    warnings=$((warnings + 1))
+  fi
+
+  # 12. 检查日志文件
+  checks=$((checks + 1))
+  local logfile; logfile=$(grep -E "^logfile " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$logfile" ]; then
+    local log_dir; log_dir=$(dirname "$logfile")
+    if [ -d "$log_dir" ]; then
+      echo "✅ [PASS] 日志文件: ${logfile}"
+    else
+      echo "⚠️  [WARN] 日志目录不存在: ${log_dir} (Redis 启动时会自动创建)"
+      warnings=$((warnings + 1))
+    fi
+  else
+    echo "ℹ️  [INFO] logfile: stdout (日志输出到标准输出)"
+  fi
+
+  # 13. 检查 pidfile 配置
+  checks=$((checks + 1))
+  local pidfile_cfg; pidfile_cfg=$(grep -E "^pidfile " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$pidfile_cfg" ]; then
+    local pid_dir; pid_dir=$(dirname "$pidfile_cfg")
+    if [ -d "$pid_dir" ]; then
+      echo "✅ [PASS] pidfile: ${pidfile_cfg}"
+    else
+      echo "⚠️  [WARN] pidfile 目录不存在: ${pid_dir}"
+      warnings=$((warnings + 1))
+    fi
+  else
+    echo "ℹ️  [INFO] pidfile 未配置 (使用默认路径)"
+  fi
+
+  # 14. 检查最大连接数
+  checks=$((checks + 1))
+  local maxclients; maxclients=$(grep -E "^maxclients " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$maxclients" ]; then
+    if [ "$maxclients" -gt 0 ] && [ "$maxclients" -le 100000 ]; then
+      echo "✅ [PASS] maxclients: ${maxclients}"
+    else
+      echo "⚠️  [WARN] maxclients: ${maxclients} (建议 1-100000)"
+      warnings=$((warnings + 1))
+    fi
+  else
+    echo "ℹ️  [INFO] maxclients 未配置 (默认 10000)"
+  fi
+
+  # 15. 检查超时设置
+  checks=$((checks + 1))
+  local timeout; timeout=$(grep -E "^timeout " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$timeout" ]; then
+    if [ "$timeout" -eq 0 ]; then
+      echo "⚠️  [WARN] timeout: 0 (连接永不超时，可能导致连接泄漏)"
+      warnings=$((warnings + 1))
+    else
+      echo "✅ [PASS] timeout: ${timeout}s"
+    fi
+  else
+    echo "ℹ️  [INFO] timeout 未配置 (默认 0，连接永不超时)"
+  fi
+
+  # 16. 检查慢查询日志
+  checks=$((checks + 1))
+  local slowlog_log_slower_than; slowlog_log_slower_than=$(grep -E "^slowlog-log-slower-than " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  local slowlog_max_len; slowlog_max_len=$(grep -E "^slowlog-max-len " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$slowlog_log_slower_than" ]; then
+    echo "✅ [PASS] slowlog-log-slower-than: ${slowlog_log_slower_than}微秒"
+  else
+    echo "ℹ️  [INFO] slowlog-log-slower-than 未配置 (默认 10000 微秒)"
+  fi
+  if [ -n "$slowlog_max_len" ]; then
+    echo "✅ [PASS] slowlog-max-len: ${slowlog_max_len}条"
+  else
+    echo "ℹ️  [INFO] slowlog-max-len 未配置 (默认 128 条)"
+  fi
+
+  # 17. 检查 tcp-backlog
+  checks=$((checks + 1))
+  local tcp_backlog; tcp_backlog=$(grep -E "^tcp-backlog " "$conf" 2>/dev/null | awk '{print $2}' || true)
+  if [ -n "$tcp_backlog" ]; then
+    local somaxconn; somaxconn=$(cat /proc/sys/net/core/somaxconn 2>/dev/null || echo "未知")
+    if [ "$tcp_backlog" -le "$somaxconn" ] 2>/dev/null; then
+      echo "✅ [PASS] tcp-backlog: ${tcp_backlog} (系统 somaxconn: ${somaxconn})"
+    else
+      echo "⚠️  [WARN] tcp-backlog: ${tcp_backlog} > 系统 somaxconn: ${somaxconn} (建议增大 somaxconn)"
+      warnings=$((warnings + 1))
+    fi
+  else
+    echo "ℹ️  [INFO] tcp-backlog 未配置 (默认 511)"
+  fi
+
+  # 18. 检查系统 overcommit_memory
+  checks=$((checks + 1))
+  local overcommit; overcommit=$(cat /proc/sys/vm/overcommit_memory 2>/dev/null || echo "")
+  if [ "$overcommit" = "1" ]; then
+    echo "✅ [PASS] vm.overcommit_memory: 1 (推荐值)"
+  elif [ "$overcommit" = "0" ]; then
+    echo "⚠️  [WARN] vm.overcommit_memory: 0 (建议设为 1，避免 Redis 后台保存失败)"
+    warnings=$((warnings + 1))
+  elif [ "$overcommit" = "2" ]; then
+    echo "⚠️  [WARN] vm.overcommit_memory: 2 (建议设为 1)"
+    warnings=$((warnings + 1))
+  fi
+
+  # 19. 检查 THP (Transparent Huge Pages)
+  checks=$((checks + 1))
+  local thp; thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -o "\[never\]" || echo "")
+  if [ -n "$thp" ]; then
+    echo "✅ [PASS] THP: disabled (推荐值)"
+  else
+    echo "⚠️  [WARN] THP 未禁用 (建议关闭，避免 Redis 延迟问题)"
+    warnings=$((warnings + 1))
+  fi
+
+  # 20. 检查 somaxconn 系统参数
+  checks=$((checks + 1))
+  local somaxconn_val; somaxconn_val=$(cat /proc/sys/net/core/somaxconn 2>/dev/null || echo "")
+  if [ -n "$somaxconn_val" ] && [ "$somaxconn_val" -ge 511 ]; then
+    echo "✅ [PASS] net.core.somaxconn: ${somaxconn_val} (≥ 511)"
+  elif [ -n "$somaxconn_val" ]; then
+    echo "⚠️  [WARN] net.core.somaxconn: ${somaxconn_val} (< 511，建议增大)"
+    warnings=$((warnings + 1))
+  fi
+
+  # ---- 汇总 ----
+  echo ""
+  echo "========================================"
+  echo "检查结果汇总"
+  echo "========================================"
+  if [ "$errors" -eq 0 ] && [ "$warnings" -eq 0 ]; then
+    echo "🎉 全部 ${checks} 项检查通过，无错误，无警告"
+  else
+    echo "共 ${checks} 项检查"
+    echo "❌ 错误: ${errors}"
+    echo "⚠️  警告: ${warnings}"
+    echo "✅ 通过: $((checks - errors - warnings))"
+  fi
+  echo "========================================"
+  echo ""
+
+  # 返回非 0 表示有错误
+  [ "$errors" -gt 0 ] && return 1 || return 0
 }
 
 redis_direct() {
@@ -919,6 +1269,7 @@ case "$TARGET" in
         show_simple_status "$unit" ;;
       status) show_status "$unit" ;;
       config) show_config redis ;;
+      check) redis_check ;;
       help|--help|-h) usage ;;
       *) echo "未知动作: $ACTION"; usage; exit 1 ;;
     esac ;;

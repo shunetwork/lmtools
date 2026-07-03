@@ -655,7 +655,7 @@ redis_direct() {
         # 优先使用 redis-cli shutdown 优雅关闭
         if [ -x "$cli" ]; then
           local auth=""
-          local conf_pw; conf_pw=$(grep -E "^requirepass " "$conf" 2>/dev/null | awk '{print $2}')
+          local conf_pw; conf_pw=$(grep -E "^requirepass " "$conf" 2>/dev/null | awk '{print $2}' || true)
           [ -n "$conf_pw" ] && auth="-a '${conf_pw}'"
           eval "$cli -p '$port' $auth shutdown" 2>/dev/null || kill -QUIT "$pid" 2>/dev/null || true
         else
@@ -906,7 +906,7 @@ show_status() {
           [ -n "$conf_port" ] && port="$conf_port"
           local conf_bind; conf_bind=$(grep -E "^bind " "$conf" 2>/dev/null | awk '{print $2}')
           [ -n "$conf_bind" ] && bind="$conf_bind"
-          local conf_pw; conf_pw=$(grep -E "^requirepass " "$conf" 2>/dev/null | awk '{print $2}')
+          local conf_pw; conf_pw=$(grep -E "^requirepass " "$conf" 2>/dev/null | awk '{print $2}' || true)
           [ -n "$conf_pw" ] && auth_args="--no-auth-warning -a '${conf_pw}'"
         fi
 

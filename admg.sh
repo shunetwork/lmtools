@@ -204,10 +204,19 @@ mysql_direct() {
   esac
 }
 
+# 查找 redis-cli 可执行文件（按优先级）
+_find_redis_cli() {
+  local cli=""
+  for c in "${PREFIX_REDIS}/bin/redis-cli" "/usr/local/bin/redis-cli" "/usr/bin/redis-cli"; do
+    [ -x "$c" ] && { cli="$c"; break; }
+  done
+  echo "$cli"
+}
+
 redis_direct() {
   local action=$1
   local bin="${PREFIX_REDIS}/bin/redis-server"
-  local cli="${PREFIX_REDIS}/bin/redis-cli"
+  local cli; cli=$(_find_redis_cli)
   # 尝试多个可能的配置文件路径
   local conf=""
   for c in /www/server/redis/redis.conf /etc/redis/redis.conf "${PREFIX_REDIS}/redis.conf"; do
@@ -498,7 +507,7 @@ show_status() {
       echo "Error Log            : /var/log/mysqld.err" ;;
     redis.service)
       local bin="${PREFIX_REDIS}/bin/redis-server"
-      local cli="${PREFIX_REDIS}/bin/redis-cli"
+      local cli; cli=$(_find_redis_cli)
       # 尝试多个可能的配置文件路径
       local conf=""
       for c in /www/server/redis/redis.conf /etc/redis/redis.conf "${PREFIX_REDIS}/redis.conf"; do
@@ -819,9 +828,11 @@ show_config() {
       done
       [ -z "$conf" ] && conf="/etc/redis/redis.conf"
 
+      local cli; cli=$(_find_redis_cli)
+
       echo "---- Redis 配置与位置 ----"
       echo "binary:       ${PREFIX_REDIS}/bin/redis-server"
-      echo "client:       ${PREFIX_REDIS}/bin/redis-cli"
+      echo "client:       ${cli:-${PREFIX_REDIS}/bin/redis-cli (未找到)}"
       echo "config:       ${conf}"
       echo "datadir:      /var/lib/redis"
       # 从配置读取 pidfile 路径
@@ -837,13 +848,13 @@ show_config() {
         echo "redis.conf 关键配置:"
         grep -E "^(port|bind|requirepass|daemonize|supervised|appendonly|dir|logfile|pidfile)" "$conf" 2>/dev/null || true
       fi
-      if [ -x "${PREFIX_REDIS}/bin/redis-cli" ]; then
+      if [ -x "$cli" ]; then
         echo
         echo "Redis 信息:"
         local port="6379"
         local conf_port; conf_port=$(grep -E "^port " "$conf" 2>/dev/null | awk '{print $2}')
         [ -n "$conf_port" ] && port="$conf_port"
-        ${PREFIX_REDIS}/bin/redis-cli -p "$port" info server 2>/dev/null | grep -E "^(redis_version|tcp_port|uptime_in_seconds|os|arch_bits)" || true
+        $cli -p "$port" info server 2>/dev/null | grep -E "^(redis_version|tcp_port|uptime_in_seconds|os|arch_bits)" || true
       fi ;;
     *) echo "未知服务: $svc" ;;
   esac

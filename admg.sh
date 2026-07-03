@@ -913,7 +913,11 @@ show_status() {
         # ---- 通过 redis-cli 获取 INFO ----
         local redis_info=""
         if [ -x "$cli" ]; then
-          redis_info=$(eval "$cli -p '$port' $auth_args info 2>/dev/null" || true)
+          if [ -n "$auth_args" ]; then
+            redis_info=$(eval "$cli -p '$port' $auth_args info" 2>/dev/null || true)
+          else
+            redis_info=$("$cli" -p "$port" info 2>/dev/null || true)
+          fi
         fi
 
         # ---- 提取各字段（注意：redis-cli 返回 \r\n，需去除 \r） ----
@@ -998,7 +1002,7 @@ show_status() {
             db_count=$(( db_count + 1 ))
             [ -z "$db_keys_list" ] && db_keys_list="${db_name}: ${db_keys_val}" || db_keys_list="${db_keys_list}, ${db_name}: ${db_keys_val}"
           fi
-        done < <(echo "$redis_info" | grep "^db[0-9]\+:")
+        done < <(echo "$redis_info" | grep "^db[0-9]\+:" || true)
 
         local qps="0"
         [ -n "$instantaneous_ops_per_sec" ] && qps="$instantaneous_ops_per_sec"
@@ -1020,7 +1024,10 @@ show_status() {
         [ "$aof_rewrite_in_progress" = "1" ] && aof_rewrite_status="是"
 
         local has_auth="未开启"
-        [ -n "$(echo "$conf_pw" 2>/dev/null)" ] && has_auth="已开启"
+        if [ -f "$conf" ]; then
+          local _pw; _pw=$(grep -E "^requirepass " "$conf" 2>/dev/null | awk '{print $2}' || true)
+          [ -n "$_pw" ] && has_auth="已开启"
+        fi
 
         local has_tls="未开启"
         [ -n "$tls_port" ] && [ "$tls_port" != "0" ] && has_tls="已开启"

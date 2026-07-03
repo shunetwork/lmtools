@@ -899,7 +899,7 @@ show_status() {
 
         # ---- 从配置读取端口、密码、bind ----
         local port="6379"
-        local auth=""
+        local auth_args=""
         local bind="127.0.0.1"
         if [ -f "$conf" ]; then
           local conf_port; conf_port=$(grep -E "^port " "$conf" 2>/dev/null | awk '{print $2}')
@@ -907,13 +907,13 @@ show_status() {
           local conf_bind; conf_bind=$(grep -E "^bind " "$conf" 2>/dev/null | awk '{print $2}')
           [ -n "$conf_bind" ] && bind="$conf_bind"
           local conf_pw; conf_pw=$(grep -E "^requirepass " "$conf" 2>/dev/null | awk '{print $2}')
-          [ -n "$conf_pw" ] && auth="-a '${conf_pw}'"
+          [ -n "$conf_pw" ] && auth_args="--no-auth-warning -a '${conf_pw}'"
         fi
 
         # ---- 通过 redis-cli 获取 INFO ----
         local redis_info=""
         if [ -x "$cli" ]; then
-          redis_info=$(eval "$cli -p '$port' $auth info 2>/dev/null" || true)
+          redis_info=$(eval "$cli -p '$port' $auth_args info 2>/dev/null" || true)
         fi
 
         # ---- 提取各字段（注意：redis-cli 返回 \r\n，需去除 \r） ----

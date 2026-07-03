@@ -1106,7 +1106,7 @@ show_status() {
         echo "密码认证             : ${has_auth}"
         echo ""
         echo "========================================"
-        echo "告警"
+        echo "告警 / 配置建议"
         echo "========================================"
         echo "✓ 服务运行正常"
         if [ -n "$mem_usage_pct" ] && [ "$mem_usage_pct" != "N/A" ]; then
@@ -1117,6 +1117,34 @@ show_status() {
         fi
         if [ -n "$rdb_last_save_str" ] && [ "$rdb_last_save_str" != "N/A" ]; then
           echo "✓ 最近持久化成功"
+        fi
+        # ---- 从配置文件中读取额外检查项 ----
+        local _timeout; _timeout=$(grep -E "^timeout " "$conf" 2>/dev/null | awk '{print $2}' || true)
+        local _save_rules; _save_rules=$(grep -E "^save " "$conf" 2>/dev/null | grep -v "^#" | head -1 || true)
+
+        # ---- 配置检查建议（参考 redis check） ----
+        if [ -z "$maxmemory" ] || [ "$maxmemory" = "0" ]; then
+          echo "⚠️  建议: 未设置 maxmemory (无内存上限，可能导致 OOM)"
+        fi
+        if [ -z "$maxmemory_policy" ] || [ "$maxmemory_policy" = "noeviction" ]; then
+          echo "⚠️  建议: 内存策略为 noeviction (内存满时写入会返回错误)"
+        fi
+        if [ -n "$_timeout" ] && [ "$_timeout" -eq 0 ]; then
+          echo "⚠️  建议: timeout=0 (连接永不超时，可能导致连接泄漏)"
+        fi
+        local _thp; _thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -o "\[never\]" || echo "")
+        if [ -z "$_thp" ]; then
+          echo "⚠️  建议: THP 未禁用 (建议关闭，避免 Redis 延迟问题)"
+        fi
+        local _overcommit; _overcommit=$(cat /proc/sys/vm/overcommit_memory 2>/dev/null || echo "")
+        if [ "$_overcommit" != "1" ]; then
+          echo "⚠️  建议: vm.overcommit_memory=${_overcommit} (建议设为 1)"
+        fi
+        if [ -z "$_save_rules" ]; then
+          echo "ℹ️  提示: 未配置 RDB save 规则 (使用默认配置)"
+        fi
+        if [ "$aof_enabled" != "1" ]; then
+          echo "ℹ️  提示: AOF 持久化未开启 (仅使用 RDB)"
         fi
       else
         echo ""

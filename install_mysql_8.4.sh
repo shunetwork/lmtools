@@ -299,6 +299,10 @@ RestartSec=5
 TimeoutSec=300
 PrivateTmp=true
 
+# 自动创建 /run/mysqld 目录并设置所有权
+RuntimeDirectory=mysqld
+RuntimeDirectoryMode=0755
+
 [Install]
 WantedBy=multi-user.target
 UNIT
@@ -324,6 +328,12 @@ chmod 0640 "${SLOW_QUERY_LOG}" 2>/dev/null || true
 
 # 运行目录
 chown "${RUN_USER}:${RUN_GROUP}" /var/run/mysqld 2>/dev/null || true
+
+# 配置 tmpfiles.d 确保重启后 /run/mysqld 目录自动创建并设置正确权限
+cat > /etc/tmpfiles.d/mysql.conf <<TMPF
+d /run/mysqld 0755 ${RUN_USER} ${RUN_GROUP} -
+TMPF
+info "tmpfiles.d 配置已写入: /etc/tmpfiles.d/mysql.conf"
 
 # =============================================================================
 # 步骤 9：启动 MySQL 服务

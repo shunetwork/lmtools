@@ -821,20 +821,41 @@ show_status() {
         echo "运行状态             : 正在运行"
         echo "Master PID           : ${pid}"
 
-        # 尝试多种方式获取 MySQL 信息（优先使用 conn.sh，其次密码文件，最后无密码）
+        # 尝试多种方式获取 MySQL 信息
+        # 使用 --defaults-extra-file 临时配置文件传递密码，避免特殊字符问题
         local mysql_cmd="${mysql_client} -u root"
+        local tmp_cnf=""
         if command -v conn.sh >/dev/null 2>&1; then
           mysql_cmd="conn.sh"
         elif [ -f /root/.mysql_root_pw ]; then
-          local pw; pw=$(grep ROOT_PASSWORD /root/.mysql_root_pw 2>/dev/null | cut -d"'" -f2 || true)
+          # 使用 source 加载密码变量（支持特殊字符）
+          # shellcheck source=/dev/null
+          source /root/.mysql_root_pw 2>/dev/null || true
+          local pw="${ROOT_PASSWORD:-}"
+          if [ -z "$pw" ]; then
+            pw=$(grep -oP "ROOT_PASSWORD='\K[^']+" /root/.mysql_root_pw 2>/dev/null || echo "")
+          fi
           if [ -n "$pw" ]; then
-            mysql_cmd="${mysql_client} -u root -p'${pw}'"
+            # 创建临时配置文件传递密码
+            tmp_cnf=$(mktemp /tmp/.my_status_cnf.XXXXXX 2>/dev/null || echo "")
+            if [ -n "$tmp_cnf" ]; then
+              cat > "$tmp_cnf" << TMP_CNF_EOF
+[client]
+user=root
+password="${pw}"
+socket=/var/run/mysqld/mysqld.sock
+connect-timeout=3
+TMP_CNF_EOF
+              chmod 600 "$tmp_cnf"
+              mysql_cmd="${mysql_client} --defaults-extra-file=${tmp_cnf} -u root"
+            fi
           fi
         fi
 
         if [ -x "$mysql_client" ]; then
-          # MySQL 版本
-          local mysql_ver; mysql_ver=$($mysql_cmd -e "SELECT VERSION();" 2>/dev/null | sed -n '2p' || echo "未知")
+          # MySQL 版本（添加超时防止卡死）
+          local mysql_ver
+          mysql_ver=$(timeout 5 $mysql_cmd -e "SELECT VERSION();" 2>/dev/null | sed -n '2p' || echo "未知")
           echo "MySQL Version        : ${mysql_ver}"
 
           # 运行时间（从进程）
@@ -844,18 +865,23 @@ show_status() {
           local uptime_str; uptime_str=$(printf "%dd %02dh" $((uptime_sec/86400)) $(((uptime_sec%86400)/3600)))
           echo "Uptime               : ${uptime_str}"
 
-          # 关键状态
-          local status_info; status_info=$($mysql_cmd -e "SHOW GLOBAL STATUS LIKE 'Questions'; SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null || true)
+          # 关键状态（合并查询，添加超时）
+          local status_info
+          status_info=$(timeout 5 $mysql_cmd -e "SHOW GLOBAL STATUS LIKE 'Questions'; SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null || true)
           local questions; questions=$(echo "$status_info" | grep "Questions" | awk '{print $2}')
           local threads; threads=$(echo "$status_info" | grep "Threads_connected" | awk '{print $2}')
           echo "Total Queries        : ${questions:-N/A}"
           echo "Connected Threads    : ${threads:-N/A}"
 
-          # InnoDB 缓冲池
-          local bp_size; bp_size=$($mysql_cmd -e "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" 2>/dev/null | sed -n '2p' | awk '{print $2}')
+          # InnoDB 缓冲池（添加超时）
+          local bp_size
+          bp_size=$(timeout 5 $mysql_cmd -e "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" 2>/dev/null | sed -n '2p' | awk '{print $2}')
           if [ -n "$bp_size" ]; then
             echo "InnoDB Buffer Pool   : $(( bp_size / 1024 / 1024 ))MB"
           fi
+
+          # 清理临时配置文件
+          rm -f "${tmp_cnf:-}" 2>/dev/null || true
         fi
       else
         echo "运行状态             : 已停止"

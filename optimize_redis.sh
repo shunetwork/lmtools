@@ -276,17 +276,58 @@ detect_os() {
   OS_VERSION=$os_ver
 }
 
+# 查找 Redis 可执行文件的辅助函数
+# 按优先级查找: 1) PREFIX_REDIS 路径 2) command -v 3) 常见安装路径
+find_redis_bin() {
+  local bin_name="$1"  # redis-server 或 redis-cli
+  local search_paths=(
+    "${PREFIX_REDIS}/bin/${bin_name}"
+    "/usr/local/bin/${bin_name}"
+    "/usr/bin/${bin_name}"
+    "/opt/redis/bin/${bin_name}"
+  )
+
+  # 优先检查 PREFIX_REDIS 路径
+  for p in "${search_paths[@]}"; do
+    if [ -x "$p" ]; then
+      echo "$p"
+      return 0
+    fi
+  done
+
+  # 尝试通过 PATH 查找
+  local which_bin
+  which_bin=$(command -v "$bin_name" 2>/dev/null || true)
+  if [ -n "$which_bin" ] && [ -x "$which_bin" ]; then
+    echo "$which_bin"
+    return 0
+  fi
+
+  # 最后尝试 find 搜索（谨慎使用，限制范围）
+  local found
+  found=$(find /usr/local /opt -name "$bin_name" -type f -executable 2>/dev/null | head -1)
+  if [ -n "$found" ]; then
+    echo "$found"
+    return 0
+  fi
+
+  echo ""
+  return 1
+}
+
 detect_redis() {
   title "Redis 当前状态"
 
-  local redis_bin="${PREFIX_REDIS}/bin/redis-server"
-  local redis_cli="${PREFIX_REDIS}/bin/redis-cli"
+  local redis_bin
+  redis_bin=$(find_redis_bin "redis-server")
+  local redis_cli
+  redis_cli=$(find_redis_bin "redis-cli")
 
-  if [ -x "$redis_bin" ]; then
+  if [ -n "$redis_bin" ] && [ -x "$redis_bin" ]; then
     local redis_ver
     redis_ver=$("$redis_bin" --version 2>/dev/null | awk '{print $3}' || echo "未知")
     echo "  Redis 版本: ${redis_ver}"
-    echo "  安装路径: ${PREFIX_REDIS}"
+    echo "  可执行文件: ${redis_bin}"
     echo "  配置文件: ${REDIS_CONF}"
 
     # 读取当前配置
@@ -310,7 +351,7 @@ detect_redis() {
     fi
 
     # 尝试连接运行时 Redis 获取更多信息
-    if [ -x "$redis_cli" ]; then
+    if [ -n "$redis_cli" ] && [ -x "$redis_cli" ]; then
       local conn_opts=("-p" "${REDIS_PORT}")
       # 尝试从配置中读取密码
       local requirepass
@@ -340,7 +381,7 @@ detect_redis() {
 
     REDIS_INSTALLED=true
   else
-    echo "  Redis 未安装或未在 ${PREFIX_REDIS} 找到"
+    echo "  Redis 未安装或未在常见路径找到"
     REDIS_INSTALLED=false
   fi
 }
@@ -985,13 +1026,20 @@ backup_config() {
 restart_redis() {
   title "重启 Redis 服务"
 
-  local redis_bin="${PREFIX_REDIS}/bin/redis-server"
-  local redis_cli="${PREFIX_REDIS}/bin/redis-cli"
+  # 使用 find_redis_bin 动态查找可执行文件
+  local redis_bin
+  redis_bin=$(find_redis_bin "redis-server")
+  local redis_cli
+  redis_cli=$(find_redis_bin "redis-cli")
 
-  if [ ! -x "$redis_bin" ]; then
-    error "Redis 可执行文件不存在: ${redis_bin}"
+  if [ -z "$redis_bin" ] || [ ! -x "$redis_bin" ]; then
+    error "Redis 可执行文件 (redis-server) 未找到！"
+    error "请检查 Redis 是否已安装，或使用 --prefix-redis 指定安装路径。"
     return 1
   fi
+
+  debug "使用 Redis 可执行文件: ${redis_bin}"
+  [ -n "$redis_cli" ] && debug "使用 redis-cli: ${redis_cli}"
 
   # 检查 systemd 服务
   if systemctl is-active redis >/dev/null 2>&1; then
@@ -1005,36 +1053,71 @@ restart_redis() {
   fi
 
   # 尝试通过 redis-cli 关闭
-  if [ -x "$redis_cli" ]; then
+  if [ -n "$redis_cli" ] && [ -x "$redis_cli" ]; then
     echo "  通过 redis-cli 发送 SHUTDOWN 命令..."
-    $redis_cli -p "$REDIS_PORT" SHUTDOWN 2>/dev/null || true
-    sleep 1
+    # 尝试从配置中读取密码
+    local conn_opts=("-p" "${REDIS_PORT}")
+    local requirepass
+    requirepass=$(grep -E "^\s*requirepass" "$REDIS_CONF" 2>/dev/null | awk '{print $2}' || echo "")
+    [ -n "$requirepass" ] && conn_opts+=("-a" "$requirepass")
+    "$redis_cli" "${conn_opts[@]}" SHUTDOWN 2>/dev/null || true
+    sleep 2
   fi
 
-  # 检查是否还有残留进程
-  local pid_file="/var/run/redis_${REDIS_PORT}.pid"
-  if [ -f "$pid_file" ]; then
-    local old_pid
-    old_pid=$(cat "$pid_file" 2>/dev/null || echo "")
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-      echo "  强制终止旧 Redis 进程 (PID: ${old_pid})..."
-      kill "$old_pid" 2>/dev/null || true
+  # 查找并终止残留的 Redis 进程
+  local old_pids
+  old_pids=$(pgrep -f "redis-server" 2>/dev/null || true)
+  if [ -n "$old_pids" ]; then
+    echo "  发现残留 Redis 进程，正在终止..."
+    # 先尝试优雅终止
+    kill $old_pids 2>/dev/null || true
+    sleep 2
+    # 强制终止仍在运行的
+    local remaining
+    remaining=$(pgrep -f "redis-server" 2>/dev/null || true)
+    if [ -n "$remaining" ]; then
+      kill -9 $remaining 2>/dev/null || true
       sleep 1
-      kill -9 "$old_pid" 2>/dev/null || true
     fi
+    ok "旧 Redis 进程已终止"
   fi
 
   # 启动 Redis
-  echo "  启动 Redis..."
+  echo "  启动 Redis (${redis_bin})..."
   if "$redis_bin" "$REDIS_CONF" > /dev/null 2>&1 & then
+    local redis_pid=$!
+    echo "  Redis PID: ${redis_pid}"
     sleep 2
-    # 验证启动
-    if $redis_cli -p "$REDIS_PORT" PING 2>/dev/null | grep -q "PONG"; then
-      ok "Redis 已成功启动"
-      return 0
-    else
-      error "Redis 启动失败，请检查日志"
+
+    # 验证启动 - 使用 redis-cli PING
+    if [ -n "$redis_cli" ] && [ -x "$redis_cli" ]; then
+      local conn_opts=("-p" "${REDIS_PORT}")
+      local requirepass
+      requirepass=$(grep -E "^\s*requirepass" "$REDIS_CONF" 2>/dev/null | awk '{print $2}' || echo "")
+      [ -n "$requirepass" ] && conn_opts+=("-a" "$requirepass")
+
+      local retry=0
+      while [ "$retry" -lt 5 ]; do
+        if "$redis_cli" "${conn_opts[@]}" PING 2>/dev/null | grep -q "PONG"; then
+          ok "Redis 已成功启动并响应 PONG"
+          return 0
+        fi
+        retry=$((retry + 1))
+        sleep 1
+      done
+      error "Redis 启动失败（${retry} 次重试后仍无响应），请检查日志"
       return 1
+    else
+      # 没有 redis-cli，通过进程存活验证
+      sleep 1
+      if kill -0 "$redis_pid" 2>/dev/null; then
+        ok "Redis 进程已在运行 (PID: ${redis_pid})"
+        warn "未找到 redis-cli，无法验证服务响应"
+        return 0
+      else
+        error "Redis 进程已退出，请检查日志"
+        return 1
+      fi
     fi
   else
     error "Redis 启动命令失败"

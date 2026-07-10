@@ -290,25 +290,93 @@ detect_mysql() {
 
     # 尝试获取当前运行时配置
     local conn_cmd=""
-    if command -v conn.sh >/dev/null 2>&1; then
-      conn_cmd="conn.sh"
-    elif [ -f /root/.mysql_root_pw ]; then
-      local pw
-      pw=$(grep ROOT_PASSWORD /root/.mysql_root_pw 2>/dev/null | cut -d"'" -f2 || true)
-      if [ -n "$pw" ]; then
-        conn_cmd="${mysql_bin} -u root -p'${pw}' -S /var/run/mysqld/mysqld.sock"
+    local mysql_pw=""
+
+    # 密码获取策略（按优先级）:
+    # 1. 从 /root/.mysql_root_pw 文件读取（由 reset_root_mysql.sh 生成）
+    #    文件格式: ROOT_PASSWORD='密码'
+    if [ -f /root/.mysql_root_pw ]; then
+      # 使用 source 加载变量（更安全，支持特殊字符）
+      # shellcheck source=/dev/null
+      source /root/.mysql_root_pw 2>/dev/null || true
+      if [ -n "${ROOT_PASSWORD:-}" ]; then
+        mysql_pw="$ROOT_PASSWORD"
+        debug "从 /root/.mysql_root_pw 读取密码成功"
+      else
+        # 如果 source 失败，尝试 grep 提取
+        mysql_pw=$(grep -oP "ROOT_PASSWORD='\K[^']+" /root/.mysql_root_pw 2>/dev/null || echo "")
+        [ -n "$mysql_pw" ] && debug "从 /root/.mysql_root_pw grep 提取密码成功"
       fi
     fi
 
-    if [ -n "$conn_cmd" ]; then
-      local bp_size
-      bp_size=$($conn_cmd -e "SHOW VARIABLES LIKE 'innodb_buffer_pool_size'" 2>/dev/null | sed -n '2p' | awk '{print $2}' || echo "未知")
-      if [ -n "$bp_size" ] && [ "$bp_size" != "未知" ]; then
-        echo "  当前 innodb_buffer_pool_size: $(( bp_size / 1024 / 1024 ))MB"
+    # 2. 从 ~/.my.cnf 读取（MySQL 客户端配置文件）
+    if [ -z "$mysql_pw" ] && [ -f /root/.my.cnf ]; then
+      mysql_pw=$(grep -oP 'password\s*=\s*\K\S+' /root/.my.cnf 2>/dev/null || echo "")
+      [ -n "$mysql_pw" ] && debug "从 /root/.my.cnf 读取密码成功"
+    fi
+
+    # 3. 从 MYSQL_PWD 环境变量读取
+    if [ -z "$mysql_pw" ] && [ -n "${MYSQL_PWD:-}" ]; then
+      mysql_pw="$MYSQL_PWD"
+      debug "从 MYSQL_PWD 环境变量读取密码成功"
+    fi
+
+    # 4. 如果以上方式都未找到密码，提示用户手动输入
+    if [ -z "$mysql_pw" ]; then
+      echo ""
+      echo "  ⚠️  未找到 MySQL root 密码"
+      echo "  已尝试以下方式:"
+      echo "    - /root/.mysql_root_pw 文件"
+      echo "    - /root/.my.cnf 客户端配置文件"
+      echo "    - MYSQL_PWD 环境变量"
+      echo ""
+      echo "  请输入 MySQL root 密码（输入将不可见）:"
+      echo -n "  > "
+      read -r -s mysql_pw
+      echo ""
+      if [ -z "$mysql_pw" ]; then
+        echo "  未输入密码，跳过运行时配置读取"
+      else
+        debug "用户手动输入密码"
       fi
-      local max_conn
-      max_conn=$($conn_cmd -e "SHOW VARIABLES LIKE 'max_connections'" 2>/dev/null | sed -n '2p' | awk '{print $2}' || echo "未知")
-      echo "  当前 max_connections: ${max_conn}"
+    fi
+
+    # 构建连接命令
+    if [ -n "$mysql_pw" ]; then
+      # 使用 --defaults-extra-file 临时配置文件传递密码，避免特殊字符问题
+      # 创建临时配置文件
+      local tmp_cnf
+      tmp_cnf=$(mktemp /tmp/.my_optimize_cnf.XXXXXX)
+      cat > "$tmp_cnf" << TMP_CNF_EOF
+[client]
+user=root
+password="${mysql_pw}"
+socket=/var/run/mysqld/mysqld.sock
+TMP_CNF_EOF
+      chmod 600 "$tmp_cnf"
+      conn_cmd="${mysql_bin} --defaults-extra-file=${tmp_cnf} -u root"
+    fi
+
+    if [ -n "$conn_cmd" ]; then
+      # 使用临时文件避免管道和 set -euo pipefail 的冲突
+      local mysql_output
+      mysql_output=$($conn_cmd -e "SHOW VARIABLES WHERE Variable_name IN ('innodb_buffer_pool_size','max_connections')" 2>/dev/null || echo "")
+      # 清理临时配置文件
+      rm -f "${tmp_cnf:-}" 2>/dev/null || true
+      if [ -n "$mysql_output" ]; then
+        local bp_size max_conn
+        bp_size=$(echo "$mysql_output" | grep "innodb_buffer_pool_size" | awk '{print $2}' || echo "")
+        max_conn=$(echo "$mysql_output" | grep "max_connections" | awk '{print $2}' || echo "")
+        if [ -n "$bp_size" ]; then
+          echo "  当前 innodb_buffer_pool_size: $(( bp_size / 1024 / 1024 ))MB"
+        fi
+        echo "  当前 max_connections: ${max_conn:-未知}"
+      else
+        echo "  运行时配置: 无法查询（MySQL 可能未运行或密码错误）"
+      fi
+    else
+      debug "未找到 MySQL root 密码，跳过运行时配置读取"
+      echo "  运行时配置: 未连接（未找到密码）"
     fi
 
     MYSQL_INSTALLED=true

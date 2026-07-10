@@ -822,62 +822,96 @@ show_status() {
         echo "Master PID           : ${pid}"
 
         # 尝试多种方式获取 MySQL 信息
-        # 使用 --defaults-extra-file 临时配置文件传递密码，避免特殊字符问题
-        local mysql_cmd="${mysql_client} -u root"
+        # 策略: 优先使用临时配置文件（安全传递密码），其次 conn.sh，最后无密码
+        local mysql_cmd=""
         local tmp_cnf=""
-        if command -v conn.sh >/dev/null 2>&1; then
-          mysql_cmd="conn.sh"
-        elif [ -f /root/.mysql_root_pw ]; then
-          # 使用 source 加载密码变量（支持特殊字符）
+        local pw=""
+
+        # 1. 从 /root/.mysql_root_pw 读取密码
+        if [ -f /root/.mysql_root_pw ]; then
           # shellcheck source=/dev/null
           source /root/.mysql_root_pw 2>/dev/null || true
-          local pw="${ROOT_PASSWORD:-}"
+          pw="${ROOT_PASSWORD:-}"
           if [ -z "$pw" ]; then
             pw=$(grep -oP "ROOT_PASSWORD='\K[^']+" /root/.mysql_root_pw 2>/dev/null || echo "")
           fi
-          if [ -n "$pw" ]; then
-            # 创建临时配置文件传递密码
-            tmp_cnf=$(mktemp /tmp/.my_status_cnf.XXXXXX 2>/dev/null || echo "")
-            if [ -n "$tmp_cnf" ]; then
-              cat > "$tmp_cnf" << TMP_CNF_EOF
+        fi
+
+        # 2. 从 ~/.my.cnf 读取密码
+        if [ -z "$pw" ] && [ -f /root/.my.cnf ]; then
+          pw=$(grep -oP 'password\s*=\s*\K\S+' /root/.my.cnf 2>/dev/null || echo "")
+        fi
+
+        # 3. 构建连接命令
+        if [ -n "$pw" ]; then
+          tmp_cnf=$(mktemp /tmp/.my_status_cnf.XXXXXX 2>/dev/null || echo "")
+          if [ -n "$tmp_cnf" ]; then
+            cat > "$tmp_cnf" << TMP_CNF_EOF
 [client]
 user=root
 password="${pw}"
 socket=/var/run/mysqld/mysqld.sock
 connect-timeout=3
 TMP_CNF_EOF
-              chmod 600 "$tmp_cnf"
-              mysql_cmd="${mysql_client} --defaults-extra-file=${tmp_cnf} -u root"
-            fi
+            chmod 600 "$tmp_cnf"
+            mysql_cmd="${mysql_client} --defaults-extra-file=${tmp_cnf} -u root"
           fi
+        elif command -v conn.sh >/dev/null 2>&1; then
+          # 无密码但 conn.sh 可用，使用 conn.sh（也加 timeout 保护）
+          mysql_cmd="conn.sh"
+        else
+          # 无密码，尝试无密码连接（可能适用于 auth_socket 插件）
+          mysql_cmd="${mysql_client} -u root -S /var/run/mysqld/mysqld.sock"
         fi
 
-        if [ -x "$mysql_client" ]; then
-          # MySQL 版本（添加超时防止卡死）
-          local mysql_ver
-          mysql_ver=$(timeout 5 $mysql_cmd -e "SELECT VERSION();" 2>/dev/null | sed -n '2p' || echo "未知")
-          echo "MySQL Version        : ${mysql_ver}"
+        if [ -x "$mysql_client" ] && [ -n "$mysql_cmd" ]; then
+          # 测试连接是否可用（快速检测，超时 3 秒）
+          local conn_test
+          conn_test=$(timeout 3 $mysql_cmd -e "SELECT 1;" 2>/dev/null || echo "FAIL")
+          if [ "$conn_test" = "FAIL" ]; then
+            # 连接失败，尝试备用方案
+            # 如果之前用了密码，尝试 conn.sh
+            if [ -n "$pw" ] && command -v conn.sh >/dev/null 2>&1; then
+              mysql_cmd="conn.sh"
+              conn_test=$(timeout 3 $mysql_cmd -e "SELECT 1;" 2>/dev/null || echo "FAIL")
+            fi
+            # 如果还是失败，尝试无密码
+            if [ "$conn_test" = "FAIL" ]; then
+              mysql_cmd="${mysql_client} -u root -S /var/run/mysqld/mysqld.sock"
+              conn_test=$(timeout 3 $mysql_cmd -e "SELECT 1;" 2>/dev/null || echo "FAIL")
+            fi
+          fi
 
-          # 运行时间（从进程）
-          local start_time; start_time=$(stat -c '%Y' "/proc/${pid}" 2>/dev/null || echo "$(date +%s)")
-          local now; now=$(date +%s)
-          local uptime_sec=$(( now - start_time ))
-          local uptime_str; uptime_str=$(printf "%dd %02dh" $((uptime_sec/86400)) $(((uptime_sec%86400)/3600)))
-          echo "Uptime               : ${uptime_str}"
+          if [ "$conn_test" != "FAIL" ]; then
+            # MySQL 版本
+            local mysql_ver
+            mysql_ver=$(timeout 5 $mysql_cmd -e "SELECT VERSION();" 2>/dev/null | sed -n '2p' || echo "未知")
+            echo "MySQL Version        : ${mysql_ver}"
 
-          # 关键状态（合并查询，添加超时）
-          local status_info
-          status_info=$(timeout 5 $mysql_cmd -e "SHOW GLOBAL STATUS LIKE 'Questions'; SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null || true)
-          local questions; questions=$(echo "$status_info" | grep "Questions" | awk '{print $2}')
-          local threads; threads=$(echo "$status_info" | grep "Threads_connected" | awk '{print $2}')
-          echo "Total Queries        : ${questions:-N/A}"
-          echo "Connected Threads    : ${threads:-N/A}"
+            # 运行时间（从进程）
+            local start_time; start_time=$(stat -c '%Y' "/proc/${pid}" 2>/dev/null || echo "$(date +%s)")
+            local now; now=$(date +%s)
+            local uptime_sec=$(( now - start_time ))
+            local uptime_str; uptime_str=$(printf "%dd %02dh" $((uptime_sec/86400)) $(((uptime_sec%86400)/3600)))
+            echo "Uptime               : ${uptime_str}"
 
-          # InnoDB 缓冲池（添加超时）
-          local bp_size
-          bp_size=$(timeout 5 $mysql_cmd -e "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" 2>/dev/null | sed -n '2p' | awk '{print $2}')
-          if [ -n "$bp_size" ]; then
-            echo "InnoDB Buffer Pool   : $(( bp_size / 1024 / 1024 ))MB"
+            # 关键状态（合并查询）
+            local status_info
+            status_info=$(timeout 5 $mysql_cmd -e "SHOW GLOBAL STATUS LIKE 'Questions'; SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null || true)
+            local questions; questions=$(echo "$status_info" | grep "Questions" | awk '{print $2}')
+            local threads; threads=$(echo "$status_info" | grep "Threads_connected" | awk '{print $2}')
+            echo "Total Queries        : ${questions:-N/A}"
+            echo "Connected Threads    : ${threads:-N/A}"
+
+            # InnoDB 缓冲池
+            local bp_size
+            bp_size=$(timeout 5 $mysql_cmd -e "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" 2>/dev/null | sed -n '2p' | awk '{print $2}')
+            if [ -n "$bp_size" ]; then
+              echo "InnoDB Buffer Pool   : $(( bp_size / 1024 / 1024 ))MB"
+            fi
+          else
+            echo "MySQL Version        : 未知（无法连接）"
+            echo "Uptime               : 0d 00h"
           fi
 
           # 清理临时配置文件

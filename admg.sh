@@ -857,10 +857,8 @@ TMP_CNF_EOF
             mysql_cmd="${mysql_client} --defaults-extra-file=${tmp_cnf} -u root"
           fi
         elif command -v conn.sh >/dev/null 2>&1; then
-          # 无密码但 conn.sh 可用，使用 conn.sh（也加 timeout 保护）
           mysql_cmd="conn.sh"
         else
-          # 无密码，尝试无密码连接（可能适用于 auth_socket 插件）
           mysql_cmd="${mysql_client} -u root -S /var/run/mysqld/mysqld.sock"
         fi
 
@@ -870,15 +868,66 @@ TMP_CNF_EOF
           conn_test=$(timeout 3 $mysql_cmd -e "SELECT 1;" 2>/dev/null || echo "FAIL")
           if [ "$conn_test" = "FAIL" ]; then
             # 连接失败，尝试备用方案
-            # 如果之前用了密码，尝试 conn.sh
             if [ -n "$pw" ] && command -v conn.sh >/dev/null 2>&1; then
               mysql_cmd="conn.sh"
               conn_test=$(timeout 3 $mysql_cmd -e "SELECT 1;" 2>/dev/null || echo "FAIL")
             fi
-            # 如果还是失败，尝试无密码
             if [ "$conn_test" = "FAIL" ]; then
               mysql_cmd="${mysql_client} -u root -S /var/run/mysqld/mysqld.sock"
               conn_test=$(timeout 3 $mysql_cmd -e "SELECT 1;" 2>/dev/null || echo "FAIL")
+            fi
+          fi
+
+          # 如果所有自动方式都失败，提示用户手动输入密码
+          if [ "$conn_test" = "FAIL" ]; then
+            echo ""
+            echo "  ⚠️  无法自动连接 MySQL"
+            echo "  已尝试: 密码文件 /root/.mysql_root_pw, conn.sh, 无密码连接"
+            echo ""
+            echo "  请输入 MySQL root 密码（输入将不可见，直接回车跳过）:"
+            echo -n "  > "
+            read -r -s pw
+            echo ""
+            if [ -n "$pw" ]; then
+              # 用输入的密码测试连接
+              local tmp_cnf2
+              tmp_cnf2=$(mktemp /tmp/.my_status_cnf.XXXXXX 2>/dev/null || echo "")
+              if [ -n "$tmp_cnf2" ]; then
+                cat > "$tmp_cnf2" << TMP_CNF_EOF
+[client]
+user=root
+password="${pw}"
+socket=/var/run/mysqld/mysqld.sock
+connect-timeout=3
+TMP_CNF_EOF
+                chmod 600 "$tmp_cnf2"
+                conn_test=$(timeout 3 ${mysql_client} --defaults-extra-file=${tmp_cnf2} -u root -e "SELECT 1;" 2>/dev/null || echo "FAIL")
+                if [ "$conn_test" != "FAIL" ]; then
+                  # 密码正确，保存到 /root/.mysql_root_pw
+                  local pw_file="/root/.mysql_root_pw"
+                  local timestamp
+                  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+                  cat > "$pw_file" << PW_EOF
+# MySQL root 密码文件
+# 由 admg.sh 自动生成
+# 生成时间: ${timestamp}
+ROOT_PASSWORD='${pw}'
+PW_EOF
+                  chmod 600 "$pw_file"
+                  echo ""
+                  echo "  ✅ 密码验证成功，已保存到 ${pw_file}"
+                  # 使用新密码重新构建连接命令
+                  mysql_cmd="${mysql_client} --defaults-extra-file=${tmp_cnf2} -u root"
+                  tmp_cnf="$tmp_cnf2"
+                else
+                  echo ""
+                  echo "  ❌ 密码验证失败，跳过 MySQL 状态查询"
+                  rm -f "$tmp_cnf2" 2>/dev/null || true
+                fi
+              fi
+            else
+              echo ""
+              echo "  未输入密码，跳过 MySQL 状态查询"
             fi
           fi
 
